@@ -294,11 +294,9 @@ class Solver(object):
         if distrib.world_size > 1 and train:
             data_loader.sampler.set_epoch(epoch)
 
-        label = ["Valid", "Train"][train]
-        name = label + f" | Epoch {epoch + 1}"
-        total = len(data_loader)
-        if args.max_batches:
-            total = min(total, args.max_batches)
+        label = "Train" if train else "Valid"
+        name = f"{label} | Epoch {epoch + 1}"
+        total = min(len(data_loader), args.max_batches or float('inf'))
         logprog = LogProgress(logger, data_loader, total=total,
                               updates=self.args.misc.num_prints, name=name)
         averager = EMA()
@@ -312,94 +310,57 @@ class Solver(object):
                 mix = sources[:, 0]
                 sources = sources[:, 1:]
 
-            if not train and self.args.valid_apply:
-                estimate = apply_model(self.model, mix, split=self.args.test.split, overlap=0)
-            else:
-                estimate = self.dmodel(mix)
-            if train and hasattr(self.model, 'transform_target'):
-                sources = self.model.transform_target(mix, sources)
-            assert estimate.shape == sources.shape, (estimate.shape, sources.shape)
-            dims = tuple(range(2, sources.dim()))
+            # Forward pass with unpacked drum component outputs
+            kick_pred, clap_pred, snare_pred, hihat_pred, openhat_pred, perc_pred = self.dmodel(mix)
 
-            if args.optim.loss == 'l1':
-                loss = F.l1_loss(estimate, sources, reduction='none')
-                loss = loss.mean(dims).mean(0)
-                reco = loss
-            elif args.optim.loss == 'mse':
-                loss = F.mse_loss(estimate, sources, reduction='none')
-                loss = loss.mean(dims)
-                reco = loss**0.5
-                reco = reco.mean(0)
-            else:
-                raise ValueError(f"Invalid loss {self.args.loss}")
-            weights = torch.tensor(args.weights).to(sources)
-            loss = (loss * weights).sum() / weights.sum()
+            # Separate target sources for each drum component
+            if sources.shape[1] != 6:
+                raise ValueError("Expected 6 target components for drum separation, but got a different number.")
+            kick_target, clap_target, snare_target, hihat_target, openhat_target, perc_target = sources
 
-            ms = 0
-            if self.quantizer is not None:
-                ms = self.quantizer.model_size()
-            if args.quant.diffq:
-                loss += args.quant.diffq * ms
+            # Calculate individual losses for each drum component
+            loss_fn = F.l1_loss if args.optim.loss == 'l1' else F.mse_loss
+            kick_loss = loss_fn(kick_pred, kick_target)
+            clap_loss = loss_fn(clap_pred, clap_target)
+            snare_loss = loss_fn(snare_pred, snare_target)
+            hihat_loss = loss_fn(hihat_pred, hihat_target)
+            openhat_loss = loss_fn(openhat_pred, openhat_target)
+            perc_loss = loss_fn(perc_pred, perc_target)
 
-            losses = {}
-            losses['reco'] = (reco * weights).sum() / weights.sum()
-            losses['ms'] = ms
+            # Aggregate the individual component losses
+            total_loss = (kick_loss + clap_loss + snare_loss + hihat_loss + openhat_loss + perc_loss) / 6
 
-            if not train:
-                nsdrs = new_sdr(sources, estimate.detach()).mean(0)
-                total = 0
-                for source, nsdr, w in zip(self.model.sources, nsdrs, weights):
-                    losses[f'nsdr_{source}'] = nsdr
-                    total += w * nsdr
-                losses['nsdr'] = total / weights.sum()
+            # Collect losses for logging (convert to scalar with .item())
+            losses = {
+                'loss': total_loss.item(),
+                'kick_loss': kick_loss.item(),
+                'clap_loss': clap_loss.item(),
+                'snare_loss': snare_loss.item(),
+                'hihat_loss': hihat_loss.item(),
+                'openhat_loss': openhat_loss.item(),
+                'perc_loss': perc_loss.item(),
+            }
 
-            if train and args.svd.penalty > 0:
-                kw = dict(args.svd)
-                kw.pop('penalty')
-                penalty = svd_penalty(self.model, **kw)
-                losses['penalty'] = penalty
-                loss += args.svd.penalty * penalty
-
-            losses['loss'] = loss
-
-            for k, source in enumerate(self.model.sources):
-                losses[f'reco_{source}'] = reco[k]
-
-            # optimize model in training mode
+            # Backpropagate and optimize in training mode
             if train:
-                loss.backward()
-                grad_norm = 0
-                grads = []
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        grad_norm += p.grad.data.norm()**2
-                        grads.append(p.grad.data)
-                losses['grad'] = grad_norm ** 0.5
+                total_loss.backward()
                 if args.optim.clip_grad:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        args.optim.clip_grad)
-
-                if self.args.flag == 'uns':
-                    for n, p in self.model.named_parameters():
-                        if p.grad is None:
-                            print('no grad', n)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.optim.clip_grad)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-                for ema in self.emas['batch']:
-                    ema.update()
+
+            # Log progress and update averages
             losses = averager(losses)
             logs = self._format_train(losses)
             logprog.update(**logs)
-            # Just in case, clear some memory
-            del loss, estimate, reco, ms
-            if args.max_batches == idx:
+
+            if args.max_batches and idx >= args.max_batches - 1:
                 break
             if self.args.debug and train:
                 break
             if self.args.flag == 'debug':
                 break
-        if train:
-            for ema in self.emas['epoch']:
-                ema.update()
-        return distrib.average(losses, idx + 1)
+
+        # Convert all loss tensors to scalars before averaging
+        avg_losses = {k: v if isinstance(v, float) else v.item() for k, v in losses.items()}
+        return distrib.average(avg_losses, idx + 1)
