@@ -318,14 +318,49 @@ class Solver(object):
                 raise ValueError("Expected 6 target components for drum separation, but got a different number.")
             kick_target, clap_target, snare_target, hihat_target, openhat_target, perc_target = sources
 
-            # Calculate individual losses for each drum component
+            # Initialize pattern-aware loss
+            pattern_loss = DrumPatternLoss(sample_rate=args.dset.samplerate).to(self.device)
+
+            # Calculate both standard and pattern-aware losses for each component
             loss_fn = F.l1_loss if args.optim.loss == 'l1' else F.mse_loss
-            kick_loss = loss_fn(kick_pred, kick_target)
-            clap_loss = loss_fn(clap_pred, clap_target)
-            snare_loss = loss_fn(snare_pred, snare_target)
-            hihat_loss = loss_fn(hihat_pred, hihat_target)
-            openhat_loss = loss_fn(openhat_pred, openhat_target)
-            perc_loss = loss_fn(perc_pred, perc_target)
+
+            # Kick drum losses
+            kick_recon_loss = loss_fn(kick_pred, kick_target)
+            kick_pattern_loss = pattern_loss(kick_pred, kick_target, 'kick')
+            kick_loss = kick_recon_loss + 0.5 * kick_pattern_loss
+
+            # Snare/Clap losses
+            clap_recon_loss = loss_fn(clap_pred, clap_target)
+            clap_pattern_loss = pattern_loss(clap_pred, clap_target, 'clap')
+            clap_loss = clap_recon_loss + 0.4 * clap_pattern_loss
+
+            snare_recon_loss = loss_fn(snare_pred, snare_target)
+            snare_pattern_loss = pattern_loss(snare_pred, snare_target, 'snare')
+            snare_loss = snare_recon_loss + 0.4 * snare_pattern_loss
+
+            # Hi-hat losses
+            hihat_recon_loss = loss_fn(hihat_pred, hihat_target)
+            hihat_pattern_loss = pattern_loss(hihat_pred, hihat_target, 'hihat')
+            hihat_loss = hihat_recon_loss + 0.3 * hihat_pattern_loss
+
+            openhat_recon_loss = loss_fn(openhat_pred, openhat_target)
+            openhat_pattern_loss = pattern_loss(openhat_pred, openhat_target, 'openhat')
+            openhat_loss = openhat_recon_loss + 0.3 * openhat_pattern_loss
+
+            # Percussion losses
+            perc_recon_loss = loss_fn(perc_pred, perc_target)
+            perc_pattern_loss = pattern_loss(perc_pred, perc_target, 'perc')
+            perc_loss = perc_recon_loss + 0.3 * perc_pattern_loss
+
+            # Weight the total loss to emphasize certain components
+            total_loss = (
+                1.2 * kick_loss +     # Emphasize kick drum accuracy
+                1.0 * clap_loss + 
+                1.1 * snare_loss +    # Slightly emphasize snare
+                0.8 * hihat_loss +    # De-emphasize hi-hats slightly
+                0.8 * openhat_loss + 
+                0.9 * perc_loss
+            ) / 6
 
             # Aggregate the individual component losses
             total_loss = (kick_loss + clap_loss + snare_loss + hihat_loss + openhat_loss + perc_loss) / 6
