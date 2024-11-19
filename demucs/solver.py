@@ -18,6 +18,7 @@ from .apply import apply_model
 from .ema import ModelEMA
 from .evaluate import evaluate, new_sdr
 from .svd import svd_penalty
+from .drum_losses import DrumPatternLoss
 from .utils import pull_metric, EMA
 
 logger = logging.getLogger(__name__)
