@@ -109,3 +109,120 @@ class Scale(nn.Module):
             scales = th.empty(batch, streams, 1, 1, device=device).uniform_(self.min, self.max)
             wav *= scales
         return wav
+
+class DrumPatternShift(nn.Module):
+    """
+    Intelligent drum pattern shift that preserves rhythmic structure
+    """
+    def __init__(self, shift=8192, tempo_aware=True, pattern_length=4):
+        super().__init__()
+        self.shift = shift
+        self.tempo_aware = tempo_aware
+        self.pattern_length = pattern_length  # in beats
+        
+    def forward(self, wav):
+        batch, sources, channels, time = wav.size()
+        if not self.training:
+            return wav[..., :time-self.shift]
+            
+        # Calculate beat-aligned shifts for each drum type
+        shifts = []
+        for source in range(sources):
+            if source == 0:  # Kick
+                # Align shifts to measure boundaries
+                shift = th.randint(0, self.pattern_length, (batch, 1, 1, 1))
+                shift = shift * (time // self.pattern_length)
+            elif source in [1, 2]:  # Snare/Clap
+                # Allow for backbeat variations
+                shift = th.randint(0, self.pattern_length // 2, (batch, 1, 1, 1))
+                shift = shift * (time // (self.pattern_length // 2))
+            else:  # Hi-hats/Percussion
+                # Finer-grained shifts for more variation
+                shift = th.randint(0, self.shift, (batch, 1, 1, 1))
+            shifts.append(shift)
+            
+        shifts = th.cat(shifts, dim=1).to(wav.device)
+        indexes = th.arange(time - self.shift, device=wav.device)
+        return wav.gather(3, indexes + shifts)
+
+
+class DrumFrequencyAugment(nn.Module):
+    """
+    Frequency-based augmentation specific to drum characteristics
+    """
+    def __init__(self, intensity=0.1):
+        super().__init__()
+        self.intensity = intensity
+        
+    def forward(self, wav):
+        if not self.training:
+            return wav
+            
+        batch, sources, channels, time = wav.size()
+        
+        # Apply frequency-specific augmentations per drum type
+        for source in range(sources):
+            if source == 0:  # Kick
+                # Enhance low frequencies (50-100 Hz)
+                wav[:, source] = self._boost_frequencies(
+                    wav[:, source], low_cut=50, high_cut=100)
+            elif source in [1, 2]:  # Snare/Clap
+                # Enhance attack transients (200-1000 Hz)
+                wav[:, source] = self._boost_transients(
+                    wav[:, source], freq_range=(200, 1000))
+            else:  # Hi-hats/Percussion
+                # Enhance high frequencies (5000-10000 Hz)
+                wav[:, source] = self._boost_frequencies(
+                    wav[:, source], low_cut=5000, high_cut=10000)
+                
+        return wav
+    
+    def _boost_frequencies(self, audio, low_cut, high_cut):
+        # FFT-based frequency boost
+        fft = th.fft.rfft(audio, dim=-1)
+        freqs = th.fft.rfftfreq(audio.shape[-1])
+        mask = ((freqs >= low_cut) & (freqs <= high_cut)).float()
+        fft *= (1 + self.intensity * mask)
+        return th.fft.irfft(fft, dim=-1)
+    
+    def _boost_transients(self, audio, freq_range):
+        # Transient detection and enhancement
+        envelope = th.abs(audio)
+        peaks = (envelope > th.roll(envelope, 1, -1)) & (envelope > th.roll(envelope, -1, -1))
+        audio[peaks] *= (1 + self.intensity)
+        return audio
+
+
+class DrumPatternMix(Remix):
+    """
+    Enhanced version of Remix specifically for drum patterns
+    """
+    def __init__(self, proba=0.5, group_size=4, pattern_aware=True):
+        super().__init__(proba, group_size)
+        self.pattern_aware = pattern_aware
+        
+    def forward(self, wav):
+        if not self.training or random.random() >= self.proba:
+            return wav
+            
+        batch, streams, channels, time = wav.size()
+        device = wav.device
+        
+        # Group similar drum types together for more realistic mixing
+        groups = {
+            'kicks': [0],
+            'snares': [1, 2],
+            'cymbals': [3, 4],
+            'percussion': [5]
+        }
+        
+        # Perform group-wise mixing
+        output = wav.clone()
+        for group_idx, source_indices in groups.items():
+            group_wav = wav[:, source_indices]
+            if len(source_indices) > 1:
+                # Mix within groups
+                permutations = th.randperm(len(source_indices))
+                output[:, source_indices] = group_wav[:, permutations]
+                
+        return output
