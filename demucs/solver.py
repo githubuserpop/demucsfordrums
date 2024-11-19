@@ -304,18 +304,16 @@ class Solver(object):
         for idx, sources in enumerate(logprog):
             sources = sources.to(self.device)
             if train:
-                sources = self.augment(sources)
-                mix = sources.sum(dim=1)
+                self.optimizer.zero_grad()
             else:
                 mix = sources[:, 0]
-                sources = sources[:, 1:]
 
             # Forward pass with unpacked drum component outputs
             kick_pred, clap_pred, snare_pred, hihat_pred, openhat_pred, perc_pred = self.dmodel(mix)
 
             # Separate target sources for each drum component
             if sources.shape[1] != 6:
-                raise ValueError("Expected 6 target components for drum separation, but got a different number.")
+                raise ValueError("Expected 6 sources for drum components")
             kick_target, clap_target, snare_target, hihat_target, openhat_target, perc_target = sources
 
             # Initialize pattern-aware loss
@@ -352,16 +350,6 @@ class Solver(object):
             perc_pattern_loss = pattern_loss(perc_pred, perc_target, 'perc')
             perc_loss = perc_recon_loss + 0.3 * perc_pattern_loss
 
-            # Weight the total loss to emphasize certain components
-            total_loss = (
-                1.2 * kick_loss +     # Emphasize kick drum accuracy
-                1.0 * clap_loss + 
-                1.1 * snare_loss +    # Slightly emphasize snare
-                0.8 * hihat_loss +    # De-emphasize hi-hats slightly
-                0.8 * openhat_loss + 
-                0.9 * perc_loss
-            ) / 6
-
             # Aggregate the individual component losses
             total_loss = (kick_loss + clap_loss + snare_loss + hihat_loss + openhat_loss + perc_loss) / 6
 
@@ -379,10 +367,7 @@ class Solver(object):
             # Backpropagate and optimize in training mode
             if train:
                 total_loss.backward()
-                if args.optim.clip_grad:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.optim.clip_grad)
                 self.optimizer.step()
-                self.optimizer.zero_grad()
 
             # Log progress and update averages
             losses = averager(losses)
