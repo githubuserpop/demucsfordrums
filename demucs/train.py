@@ -31,6 +31,11 @@ from .utils import random_subset
 
 logger = logging.getLogger(__name__)
 
+TRAINING_FOLDERS = [
+    '/DATA/Training Data/organized drums',
+    '/DATA/Training Data/harsukh beat stems',
+    '/DATA/Training Data/song drum stems'
+]
 
 class TorchHDemucsWrapper(nn.Module):
     """Wrapper around torchaudio HDemucs implementation to provide the proper metadata for model evaluation."""
@@ -143,6 +148,45 @@ def get_solver(args, model_only=False):
 
     logger.info(f"Train/valid set sizes: {len(train_set)}, {len(valid_set)}")
     return Solver(loaders, model, optimizer, args)
+
+
+def load_custom_data(training_folders, batch_size):
+    """
+    Function to set up the dataloader for training data across the specified folders
+    with variable sample rates.
+    """
+    print("Loading data...")
+    datasets = []
+    for folder in training_folders:
+        if os.path.exists(folder):
+            print(f"Loading data from: {folder}")
+            # Initialize the dataset for each folder
+            dataset = Dataset(
+                root=folder,
+                streams=["drums"],  # Focus on drums
+                channels=2,         # Stereo audio
+                duration=10,        # Segment duration in seconds
+                samplerate=None,    # Use the sample rate of the files (no resampling)
+                stride=5,           # Overlap between segments
+                augment=True        # Apply data augmentation
+            )
+            datasets.append(dataset)
+        else:
+            print(f"Folder not found: {folder}")
+    
+    if datasets:
+        print("Combining datasets...")
+        combined_dataset = torch.utils.data.ConcatDataset(datasets)
+        dataloader = DataLoader(
+            combined_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+        return dataloader
+    else:
+        raise RuntimeError("No datasets found in the specified folders.")
 
 
 @hydra_main(config_path="../conf", config_name="config", version_base="1.1")
