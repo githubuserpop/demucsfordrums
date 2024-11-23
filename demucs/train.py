@@ -28,6 +28,7 @@ from .repitch import RepitchedWrapper
 from .solver import Solver
 from .states import capture_init
 from .utils import random_subset
+from .drum_datasets import get_drum_datasets, DrumDataset
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,11 @@ def get_datasets(args):
     if args.dset.backend:
         torchaudio.set_audio_backend(args.dset.backend)
 
+    # If using drum-specific dataset
+    if args.model == 'hdemucs' and hasattr(args.dset, 'use_drums') and args.dset.use_drums:
+        return get_drum_datasets(args)
+
+    # Original dataset loading logic for other cases
     train_set, valid_set = (get_musdb_wav_datasets(args.dset) if args.dset.use_musdb else ([], []))
     if args.dset.wav:
         extra_train_set, extra_valid_set = get_wav_datasets(args.dset)
@@ -115,8 +121,40 @@ def get_datasets(args):
 
     if args.dset.valid_samples:
         valid_set = random_subset(valid_set, args.dset.valid_samples)
+    return train_set, valid_set
+
+
+def get_drum_datasets(args):
+    """Creates train and validation datasets for drum separation."""
+    sample_dirs = [
+        '/DATA/Training Data/organized drums'
+    ]
     
-    assert train_set and valid_set, "Both training and validation sets must be non-empty."
+    stem_dirs = [
+        '/DATA/Training Data/song drum stems',
+        '/DATA/Training Data/harsukh beat stems'
+    ]
+    
+    train_dataset = DrumDataset(
+        sample_dirs=sample_dirs,
+        stem_dirs=stem_dirs,
+        sources=args.dset.sources,
+        sample_rate=args.dset.samplerate,
+        segment_duration=args.dset.segment,
+        channels=args.dset.channels,
+        normalize=args.dset.normalize,
+        sample_ratio=args.dset.sample_ratio
+    )
+    
+    # Create a smaller validation set (10% of training data)
+    valid_size = int(0.1 * len(train_dataset))
+    train_size = len(train_dataset) - valid_size
+    train_set, valid_set = torch.utils.data.random_split(
+        train_dataset, 
+        [train_size, valid_size],
+        generator=torch.Generator().manual_seed(args.seed)
+    )
+    
     return train_set, valid_set
 
 
