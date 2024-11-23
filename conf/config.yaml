@@ -10,10 +10,11 @@ dummy:
 dset:
   musdb: /checkpoint/defossez/datasets/musdbhq
   musdb_samplerate: 44100
-  use_musdb: true   # set to false to not use musdb as training data.
+  use_musdb: false   # Changed to false
+  use_drums: true    # Add this line
   wav:  # path to custom wav dataset
   wav2:  # second custom wav dataset
-  segment: 11
+  segment: 4         # Changed from 11 to 4
   shift: 1
   train_valid: false
   full_cv: true
@@ -21,9 +22,8 @@ dset:
   channels: 2
   normalize: true
   metadata: ./metadata
-  sources: ['drums', 'bass', 'other', 'vocals']
-  valid_samples: # valid dataset size
-  backend: null   # if provided select torchaudio backend.
+  sources: ['kicks', 'snares', 'claps', 'hi hats', 'open hats', 'percs']  # Changed sources
+  sample_ratio: 0.3  # Add this line
 
 test:
   save: False
@@ -37,8 +37,8 @@ test:
   metric: 'loss'  # metric used for best model selection on the valid set, can also be nsdr
   nonhq:   # path to non hq MusDB for evaluation
 
-epochs: 360
-batch_size: 64
+epochs: 100
+batch_size: 16
 max_batches:  # limit the number of batches per epoch, useful for debugging
               # or if your dataset is gigantic.
 optim:
@@ -55,7 +55,7 @@ debug: false
 valid_apply: true
 flag:
 save_every:
-weights: [1., 1., 1., 1.]  # weights over each source for the training/valid loss.
+weights: [1., 1., 1., 1., 1., 1.]  # weights for each drum source (kicks, snares, claps, hi hats, open hats, percs)
 
 augment:
   shift_same: false
@@ -91,7 +91,7 @@ ema:
 
 use_train_segment: true  # to remove
 model_segment:  # override the segment parameter for the model, usually 4 times the training segment.
-model: demucs  # see demucs/train.py for the possibilities, and config for each model hereafter.
+model: hdemucs  # see demucs/train.py for the possibilities, and config for each model hereafter.
 demucs:  # see demucs/demucs.py for a detailed description
   # Channels
   channels: 64
@@ -149,7 +149,7 @@ hdemucs:  # see demucs/hdemucs.py for a detailed description
   kernel_size: 8
   stride: 4
   time_stride: 2
-  context: 1
+  context: 3
   context_enc: 0
   # normalization
   norm_starts: 4
@@ -163,6 +163,8 @@ hdemucs:  # see demucs/hdemucs.py for a detailed description
   dconv_init: 1e-3
   # Weight init
   rescale: 0.1
+  normalize: true
+  resample: true
 
 # Torchaudio implementation of HDemucs
 torch_hdemucs:
@@ -180,7 +182,7 @@ torch_hdemucs:
   kernel_size: 8
   stride: 4
   time_stride: 2
-  context: 1
+  context: 3
   context_enc: 0
   # normalization
   norm_starts: 4
@@ -191,6 +193,8 @@ torch_hdemucs:
   dconv_attn: 4
   dconv_lstm: 4
   dconv_init: 1e-3
+  normalize: true
+  resample: true
 
 htdemucs:  # see demucs/htdemucs.py for a detailed description
   # Channels
