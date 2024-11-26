@@ -45,7 +45,7 @@ class DrumDataset(Dataset):
             has_individual_stems = any((dir_path / source).exists() for source in sources)
             
             if has_individual_stems:
-                # This is a directory with individual drum stems (like harsukh beat stems)
+                # This is a directory with individual drum stems (like beat stems)
                 for source in sources:
                     source_path = dir_path / source
                     if source_path.exists():
@@ -115,7 +115,7 @@ class DrumDataset(Dataset):
                             (len(self.stem_paths) == 0 or random.random() < 0.7))  # Favor individual stems
             
             if use_individual:
-                # Use individual stems from harsukh beat stems
+                # Use individual stems from beat stems
                 idx = random.randint(0, len(self.individual_stem_paths) - 1)
                 stem_path, source_type = self.individual_stem_paths[idx]
                 

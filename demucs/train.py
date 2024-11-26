@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 TRAINING_FOLDERS = [
     '/DATA/Training Data/organized drums',
-    '/DATA/Training Data/harsukh beat stems',
+    '/DATA/Training Data/beat stems',
     '/DATA/Training Data/song drum stems'
 ]
 
@@ -132,7 +132,7 @@ def get_drum_datasets(args):
     
     stem_dirs = [
         '/DATA/Training Data/song drum stems',
-        '/DATA/Training Data/harsukh beat stems'
+        '/DATA/Training Data/beat stems'
     ]
     
     train_dataset = DrumDataset(

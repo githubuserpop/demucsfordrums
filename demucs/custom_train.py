@@ -7,7 +7,7 @@ import os
 
 # Path and configuration
 TRAINING_FOLDERS = [
-    '/DATA/Training Data/harsukh beat stems'  # Currently using only this folder
+    '/DATA/Training Data/beat stems'  # Currently using only this folder
 ]
 BATCH_SIZE = 4
 
