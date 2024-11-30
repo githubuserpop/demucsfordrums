@@ -25,7 +25,7 @@ This project extends the original Demucs music source separation model to focus 
 
 ## Dataset
 
-The model is trained on a comprehensive dataset consisting of:
+The model ***will be*** (WIP) trained on a comprehensive dataset consisting of:
 - 1,860 custom-produced stems organized by drum type
 - 25,418 high-quality drum samples from various producers
 - 4,763 track stems divided into:
