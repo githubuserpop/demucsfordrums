@@ -95,26 +95,34 @@ class HEncLayer(nn.Module):
             pad = kernel_size // 4
         else:
             pad = 0
-        klass = nn.Conv1d
+        self.pad = pad
         self.freq = freq
         self.kernel_size = kernel_size
         self.stride = stride
         self.empty = empty
         self.norm = norm
+        self.context = context
         self.pad = pad
+        self.last = False
+
         if freq:
             kernel_size = [kernel_size, 1]
             stride = [stride, 1]
             pad = [pad, 0]
-            klass = nn.Conv2d
-        self.conv = klass(chin, chout, kernel_size, stride, pad)
-        if self.empty:
-            return
-        self.norm1 = norm_fn(chout)
+            self.conv = nn.Conv2d(chin, chout, kernel_size, stride=stride, padding=pad)
+        else:
+            self.conv = nn.Conv1d(chin, chout, kernel_size, stride=stride, padding=pad)
+
+        if norm:
+            self.norm1 = norm_fn(chout)
+        else:
+            self.norm1 = nn.Identity()
+
         self.rewrite = None
         if rewrite:
-            self.rewrite = klass(chout, 2 * chout, 1 + 2 * context, 1, context)
-            self.norm2 = norm_fn(2 * chout)
+            self.rewrite = nn.Conv2d(chout, 2 * chout, 1 + 2 * context, 1, context)
+            if norm:
+                self.norm2 = norm_fn(2 * chout)
 
         self.dconv = None
         if dconv:
@@ -157,253 +165,260 @@ class HEncLayer(nn.Module):
         return z
 
 
-class MultiWrap(nn.Module):
-    """
-    Takes one layer and replicate it N times. each replica will act
-    on a frequency band. All is done so that if the N replica have the same weights,
-    then this is exactly equivalent to applying the original module on all frequencies.
-
-    This is a bit over-engineered to avoid edge artifacts when splitting
-    the frequency bands, but it is possible the naive implementation would work as well...
-    """
-    def __init__(self, layer, split_ratios):
-        """
-        Args:
-            layer: module to clone, must be either HEncLayer or HDecLayer.
-            split_ratios: list of float indicating which ratio to keep for each band.
-        """
-        super().__init__()
-        self.split_ratios = split_ratios
-        self.layers = nn.ModuleList()
-        self.conv = isinstance(layer, HEncLayer)
-        assert not layer.norm
-        assert layer.freq
-        assert layer.pad
-        if not self.conv:
-            assert not layer.context_freq
-        for k in range(len(split_ratios) + 1):
-            lay = deepcopy(layer)
-            if self.conv:
-                lay.conv.padding = (0, 0)
-            else:
-                lay.pad = False
-            for m in lay.modules():
-                if hasattr(m, 'reset_parameters'):
-                    m.reset_parameters()
-            self.layers.append(lay)
-
-    def forward(self, x, skip=None, length=None):
-        B, C, Fr, T = x.shape
-
-        ratios = list(self.split_ratios) + [1]
-        start = 0
-        outs = []
-        for ratio, layer in zip(ratios, self.layers):
-            if self.conv:
-                pad = layer.kernel_size // 4
-                if ratio == 1:
-                    limit = Fr
-                    frames = -1
-                else:
-                    limit = int(round(Fr * ratio))
-                    le = limit - start
-                    if start == 0:
-                        le += pad
-                    frames = round((le - layer.kernel_size) / layer.stride + 1)
-                    limit = start + (frames - 1) * layer.stride + layer.kernel_size
-                    if start == 0:
-                        limit -= pad
-                assert limit - start > 0, (limit, start)
-                assert limit <= Fr, (limit, Fr)
-                y = x[:, :, start:limit, :]
-                if start == 0:
-                    y = F.pad(y, (0, 0, pad, 0))
-                if ratio == 1:
-                    y = F.pad(y, (0, 0, 0, pad))
-                outs.append(layer(y))
-                start = limit - layer.kernel_size + layer.stride
-            else:
-                if ratio == 1:
-                    limit = Fr
-                else:
-                    limit = int(round(Fr * ratio))
-                last = layer.last
-                layer.last = True
-
-                y = x[:, :, start:limit]
-                s = skip[:, :, start:limit]
-                out, _ = layer(y, s, None)
-                if outs:
-                    outs[-1][:, :, -layer.stride:] += (
-                        out[:, :, :layer.stride] - layer.conv_tr.bias.view(1, -1, 1, 1))
-                    out = out[:, :, layer.stride:]
-                if ratio == 1:
-                    out = out[:, :, :-layer.stride // 2, :]
-                if start == 0:
-                    out = out[:, :, layer.stride // 2:, :]
-                outs.append(out)
-                layer.last = last
-                start = limit
-        out = torch.cat(outs, dim=2)
-        if not self.conv and not last:
-            out = F.gelu(out)
-        if self.conv:
-            return out
-        else:
-            return out, None
-
-
 class HDecLayer(nn.Module):
-    def __init__(self, chin, chout, last=False, kernel_size=8, stride=4, norm_groups=1, empty=False,
-                 freq=True, dconv=True, norm=True, context=1, dconv_kw={}, pad=True,
-                 context_freq=True, rewrite=True):
-        """
-        Same as HEncLayer but for decoder. See `HEncLayer` for documentation.
-        """
+    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, empty=False,
+                 freq=True, norm=True, context=1, dconv=True, pad=True, last=False,
+                 context_freq=False, **kwargs):
         super().__init__()
-        norm_fn = lambda d: nn.Identity()  # noqa
-        if norm:
-            norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa
-        if pad:
-            pad = kernel_size // 4
-        else:
-            pad = 0
-        self.pad = pad
-        self.last = last
-        self.freq = freq
         self.chin = chin
-        self.empty = empty
-        self.stride = stride
+        self.chout = chout
+        self.freq = freq
         self.kernel_size = kernel_size
+        self.stride = stride
+        self.empty = empty
         self.norm = norm
+        self.context = context
         self.context_freq = context_freq
-        klass = nn.Conv1d
-        klass_tr = nn.ConvTranspose1d
+        self.last = last
+
+        # Calculate padding size
+        if isinstance(pad, bool):
+            self.pad_size = kernel_size // 4 if pad else 0
+        else:
+            self.pad_size = pad
+
         if freq:
             kernel_size = [kernel_size, 1]
             stride = [stride, 1]
-            klass = nn.Conv2d
-            klass_tr = nn.ConvTranspose2d
-        self.conv_tr = klass_tr(chin, chout, kernel_size, stride)
-        self.norm2 = norm_fn(chout)
-        if self.empty:
-            return
-        self.rewrite = None
-        if rewrite:
-            if context_freq:
-                self.rewrite = klass(chin, 2 * chin, 1 + 2 * context, 1, context)
-            else:
-                self.rewrite = klass(chin, 2 * chin, [1, 1 + 2 * context], 1,
-                                     [0, context])
-            self.norm1 = norm_fn(2 * chin)
-
-        self.dconv = None
-        if dconv:
-            self.dconv = DConv(chin, **dconv_kw)
-
-    def forward(self, x, skip, length):
-        if self.freq and x.dim() == 3:
-            B, C, T = x.shape
-            x = x.view(B, self.chin, -1, T)
-
-        if not self.empty:
-            x = x + skip
-
-            if self.rewrite:
-                y = F.glu(self.norm1(self.rewrite(x)), dim=1)
-            else:
-                y = x
-            if self.dconv:
-                if self.freq:
-                    B, C, Fr, T = y.shape
-                    y = y.permute(0, 2, 1, 3).reshape(-1, C, T)
-                y = self.dconv(y)
-                if self.freq:
-                    y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
+            padding = [self.pad_size, 0]
+            self.conv = nn.ConvTranspose2d(chin, chout, kernel_size, stride=stride, padding=padding)
         else:
-            y = x
-            assert skip is None
-        z = self.norm2(self.conv_tr(y))
-        if self.freq:
-            if self.pad:
-                z = z[..., self.pad:-self.pad, :]
+            self.conv = nn.ConvTranspose1d(chin, chout, kernel_size, stride=stride, padding=self.pad_size)
+
+        if norm:
+            self.norm = nn.GroupNorm(norm_groups, chout)
         else:
-            z = z[..., self.pad:self.pad + length]
-            assert z.shape[-1] == length, (z.shape[-1], length)
+            self.norm = nn.Identity()
+
+    def forward(self, x):
+        """Forward pass for the decoder layer.
+        Args:
+            x (Tensor): Input tensor [B, C, F, T]
+        Returns:
+            Tensor: Output tensor [B, C, F', T]
+        """
+        # Apply transposed convolution
+        x = self.conv(x)
+        
+        # Apply normalization
+        x = self.norm(x)
+        
+        # Apply activation if not the last layer
         if not self.last:
-            z = F.gelu(z)
-        return z, y
+            x = F.gelu(x)
+        
+        return x
+
+
+class MultiWrap(nn.Module):
+    """Wrap a layer to support multiple frequency bands processing."""
+    def __init__(self, layer, **kwargs):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, x_band):
+        """Forward pass for the wrapped layer.
+        Args:
+            x_band (Tensor): Input tensor [B, C, F, T]
+        Returns:
+            Tensor: Output tensor [B, C, F', T]
+        """
+        return self.layer(x_band)
 
 
 class HDemucs(nn.Module):
-    # Initialization and other methods as before
+    """Hybrid Demucs architecture for drum separation."""
+    def __init__(self, channels=48, growth=2, nfft=4096, 
+                 depth=6, freq_emb_dim=32, normalize=True):
+        """Initialize the HDemucs model.
+        Args:
+            channels (int): Initial number of channels
+            growth (int): Factor by which the channels grow per layer
+            nfft (int): Size of FFT
+            depth (int): Number of layers
+            freq_emb_dim (int): Dimension of frequency embedding
+            normalize (bool): Whether to normalize input
+        """
+        super().__init__()
+        self.channels = channels
+        self.depth = depth
+        self.nfft = nfft
+        self.normalize = normalize
+        self.floor = 1e-8
+        self.rescale = 0.1
+
+        self.freq_emb = nn.Sequential(
+            nn.Linear(1, freq_emb_dim),
+            nn.ReLU(),
+            nn.Linear(freq_emb_dim, freq_emb_dim),
+            nn.ReLU(),
+            nn.Linear(freq_emb_dim, channels)
+        )
+
+        # Channel projection for input
+        self.channel_proj = nn.Conv2d(2, channels, 1)
+
+        # Initialize decoders for each drum component
+        self.kick_decoder = nn.ModuleList()
+        self.snare_decoder = nn.ModuleList()
+        self.hihat_decoder = nn.ModuleList()
+        self.clap_decoder = nn.ModuleList()
+        self.openhat_decoder = nn.ModuleList()
+        self.perc_decoder = nn.ModuleList()
+
+        chin = channels
+        for index in range(depth):
+            chout = channels * growth
+            last = index == depth - 1
+            
+            # Create decoder layers for each component
+            freq = True  # Always True since we're working in frequency domain
+            
+            # Kick decoder (focused on low frequencies)
+            self.kick_decoder.append(
+                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+
+            # Snare decoder (mid frequencies)
+            self.snare_decoder.append(
+                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+
+            # Hi-hat decoder (high frequencies)
+            self.hihat_decoder.append(
+                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+
+            # Clap decoder (mid-high frequencies)
+            self.clap_decoder.append(
+                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+
+            # Open hat decoder (high frequencies)
+            self.openhat_decoder.append(
+                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+
+            # Percussion decoder (full frequency range)
+            self.perc_decoder.append(
+                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+
+            chin = chout
+
+    def _spec(self, x):
+        """Convert input audio to spectrogram.
+        Args:
+            x (Tensor): Input audio [B, C, T]
+        Returns:
+            Tensor: Complex spectrogram [B, C, F, T]
+        """
+        nfft = self.nfft
+        hl = nfft // 4
+        window = torch.hann_window(nfft).to(x.device)
+        
+        # Handle input shape
+        B, C, T = x.shape
+        specs = []
+        
+        for c in range(C):
+            # Compute STFT for each channel
+            spec = torch.stft(x[:, c], n_fft=nfft, hop_length=hl,
+                            window=window, win_length=nfft,
+                            normalized=True, center=True,
+                            return_complex=True)  # [B, F, T]
+            specs.append(spec)
+        
+        # Stack channels
+        x = torch.stack(specs, dim=1)  # [B, C, F, T]
+        
+        # Convert to magnitude spectrogram
+        return x.abs()
 
     def forward(self, mix):
-        x = mix
-        length = x.shape[-1]
+        """
+        Forward pass for the drum separation model.
+        Args:
+            mix (Tensor): Input mixture of shape [B, C, T] or [B, T]
+        Returns:
+            Tensor: Separated drums of shape [B, 6, C, T] where 6 is the number of components
+                   (kick, snare, hihat, clap, openhat, perc)
+        """
+        # Handle 2D input (single channel)
+        if mix.dim() == 2:
+            mix = mix.unsqueeze(1)
+        
+        # Store original dimensions
+        B, C, T = mix.shape
+        
+        # Convert to spectrogram
+        x = self._spec(mix)  # [B, C, F, T]
+        
+        if self.normalize:
+            mono = mix.mean(dim=1, keepdim=True)
+            mean = mono.mean(dim=-1, keepdim=True)
+            std = mono.std(dim=-1, keepdim=True)
+            x = (x - mean.unsqueeze(-2)) / (self.floor + std.unsqueeze(-2))
+        else:
+            std = 1
+            mean = 0
 
-        # Compute spectrogram and magnitude
-        z = self._spec(mix)
-        mag = self._magnitude(z).to(mix.device)
-        x = mag
+        # Project input channels to model channels
+        x = self.channel_proj(x)  # [B, channels, F, T]
 
-        B, C, Fq, T = x.shape
+        # Prepare frequency embedding
+        freqs = torch.linspace(0, 1, x.shape[2], device=x.device)
+        freqs = freqs.view(-1, 1)  # [F, 1]
+        freq_emb = self.freq_emb(freqs)  # [F, channels]
+        
+        # Reshape frequency embedding for addition
+        freq_emb = freq_emb.transpose(0, 1)  # [channels, F]
+        freq_emb = freq_emb.unsqueeze(0).unsqueeze(-1)  # [1, channels, F, 1]
+        freq_emb = freq_emb.expand(B, -1, -1, x.shape[-1])  # [B, channels, F, T]
+        
+        # Add frequency embedding
+        x = x + freq_emb
 
-        # Normalize the input
-        mean = x.mean(dim=(1, 2, 3), keepdim=True)
-        std = x.std(dim=(1, 2, 3), keepdim=True)
-        x = (x - mean) / (1e-5 + std)
+        # Split into frequency bands for each component
+        outputs = []
+        for decoder_list in [self.kick_decoder, self.snare_decoder, self.hihat_decoder,
+                           self.clap_decoder, self.openhat_decoder, self.perc_decoder]:
+            x_band = x
+            for layer in decoder_list:
+                x_band = layer(x_band)
+            outputs.append(x_band)
 
-        # For hybrid branch, prepare time-domain input and initialize `pre` when needed
-        if self.hybrid:
-            xt = mix
-            meant = xt.mean(dim=(1, 2), keepdim=True)
-            stdt = xt.std(dim=(1, 2), keepdim=True)
-            xt = (xt - meant) / (1e-5 + stdt)
-            pre_initialized = False
-
-        # Encoding and decoding phases
-        saved, saved_t, lengths, lengths_t = [], [], [], []
-        for idx, encode in enumerate(self.encoder):
-            lengths.append(x.shape[-1])
-            inject = None
-            if self.hybrid and idx < len(self.tencoder):
-                lengths_t.append(xt.shape[-1])
-                time_encoder = self.tencoder[idx]
-                xt = time_encoder(xt)
-                if not time_encoder.empty:
-                    saved_t.append(xt)
-                else:
-                    inject = xt
-            x = encode(x, inject)
-            saved.append(x)
-
-        # Initialize component outputs consistently
-        kick_output = clap_output = snare_output = hihat_output = openhat_output = perc_output = torch.zeros_like(x)
-
-        # Decoding phase
-        for idx, (kick_dec, clap_dec, snare_dec, hihat_dec, openhat_dec, perc_dec) in enumerate(
-                zip(self.kick_decoder, self.clap_decoder, self.snare_decoder, self.hihat_decoder, self.openhat_decoder, self.perc_decoder)):
-            
-            skip = saved.pop(-1)
-            kick_output, _ = kick_dec(kick_output, skip, lengths.pop(-1))
-            clap_output, _ = clap_dec(clap_output, skip, lengths.pop(-1))
-            snare_output, _ = snare_dec(snare_output, skip, lengths.pop(-1))
-            hihat_output, _ = hihat_dec(hihat_output, skip, lengths.pop(-1))
-            openhat_output, _ = openhat_dec(openhat_output, skip, lengths.pop(-1))
-            perc_output, _ = perc_dec(perc_output, skip, lengths.pop(-1))
-
-            # Hybrid branch handling with optimized initialization
-            if self.hybrid:
-                offset = self.depth - len(self.tdecoder)
-                if idx >= offset:
-                    time_decoder = self.tdecoder[idx - offset]
-                    length_t = lengths_t.pop(-1)
-                    if not pre_initialized:
-                        pre = torch.zeros_like(kick_output[:, :, :1])
-                        pre_initialized = True
-                    xt, _ = time_decoder(pre if time_decoder.empty else saved_t.pop(-1), None if time_decoder.empty else skip, length_t)
-
-        # Restore and return outputs
-        return (kick_output * std + mean, clap_output * std + mean, snare_output * std + mean,
-                hihat_output * std + mean, openhat_output * std + mean, perc_output * std + mean)
+        # Combine all outputs
+        x = torch.stack(outputs, dim=1)  # [B, 6, channels, F, T]
+        
+        if self.normalize:
+            x = x * std.unsqueeze(-2)
+            x = x + mean.unsqueeze(-2)
+        
+        x = x * self.rescale
+        
+        # Convert back to time domain
+        B, D, Ch, F, T = x.shape
+        x = x.view(B * D * Ch, F, T)  # Reshape for batch processing
+        
+        # Convert magnitude to complex
+        x = x.to(torch.complex64)  # Convert to complex numbers assuming phase is 0
+        
+        # Inverse STFT
+        nfft = self.nfft
+        hl = nfft // 4
+        x = torch.istft(x, n_fft=nfft, hop_length=hl,
+                       window=torch.hann_window(nfft).to(x.device),
+                       win_length=nfft, normalized=True, center=True)
+        
+        # Reshape back to match input channels
+        x = x.view(B, D, C, -1)  # [B, 6, C, T]
+        
+        # Trim to original length
+        x = x[..., :T]
+        
+        return x
