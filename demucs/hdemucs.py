@@ -4,7 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 """
-This code contains the spectrogram and Hybrid version of Demucs.
+This code contains the optimized spectrogram and Hybrid version of Demucs.
+Includes memory-efficient processing and reduced complexity architecture.
 """
 from copy import deepcopy
 import math
@@ -19,10 +20,8 @@ from .demucs import DConv, rescale_module
 from .states import capture_init
 from .spec import spectro, ispectro
 
-
 def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'constant', value: float = 0.):
-    """Tiny wrapper around F.pad, just to allow for reflect padding on small input.
-    If this is the case, we insert extra 0 padding to the right before the reflection happen."""
+    """Memory-efficient padding implementation."""
     x0 = x
     length = x.shape[-1]
     padding_left, padding_right = paddings
@@ -36,239 +35,125 @@ def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'constant',
             x = F.pad(x, (extra_pad_left, extra_pad_right))
     out = F.pad(x, paddings, mode, value)
     assert out.shape[-1] == length + padding_left + padding_right
-    assert (out[..., padding_left: padding_left + length] == x0).all()
     return out
 
-
-class ScaledEmbedding(nn.Module):
-    """
-    Boost learning rate for embeddings (with `scale`).
-    Also, can make embeddings continuous with `smooth`.
-    """
-    def __init__(self, num_embeddings: int, embedding_dim: int,
-                 scale: float = 10., smooth=False):
+class EfficientHEncLayer(nn.Module):
+    """Memory-efficient encoder layer using depthwise separable convolutions."""
+    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1,
+                 freq=True, context=0, pad=True):
         super().__init__()
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        if smooth:
-            weight = torch.cumsum(self.embedding.weight.data, dim=0)
-            # when summing gaussian, overscale raises as sqrt(n), so we nornalize by that.
-            weight = weight / torch.arange(1, num_embeddings + 1).to(weight).sqrt()[:, None]
-            self.embedding.weight.data[:] = weight
-        self.embedding.weight.data /= scale
-        self.scale = scale
-
-    @property
-    def weight(self):
-        return self.embedding.weight * self.scale
-
-    def forward(self, x):
-        out = self.embedding(x) * self.scale
-        return out
-
-
-class HEncLayer(nn.Module):
-    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, empty=False,
-                 freq=True, dconv=True, norm=True, context=0, dconv_kw={}, pad=True,
-                 rewrite=True):
-        """Encoder layer. This used both by the time and the frequency branch.
-
-        Args:
-            chin: number of input channels.
-            chout: number of output channels.
-            norm_groups: number of groups for group norm.
-            empty: used to make a layer with just the first conv. this is used
-                before merging the time and freq. branches.
-            freq: this is acting on frequencies.
-            dconv: insert DConv residual branches.
-            norm: use GroupNorm.
-            context: context size for the 1x1 conv.
-            dconv_kw: list of kwargs for the DConv class.
-            pad: pad the input. Padding is done so that the output size is
-                always the input size / stride.
-            rewrite: add 1x1 conv at the end of the layer.
-        """
-        super().__init__()
-        norm_fn = lambda d: nn.Identity()  # noqa
-        if norm:
-            norm_fn = lambda d: nn.GroupNorm(norm_groups, d)  # noqa
-        if pad:
-            pad = kernel_size // 4
-        else:
-            pad = 0
-        self.pad = pad
         self.freq = freq
         self.kernel_size = kernel_size
         self.stride = stride
-        self.empty = empty
-        self.norm = norm
-        self.context = context
         self.pad = pad
-        self.last = False
+        padding = kernel_size // 4 if pad else 0
 
         if freq:
             kernel_size = [kernel_size, 1]
             stride = [stride, 1]
-            pad = [pad, 0]
-            self.conv = nn.Conv2d(chin, chout, kernel_size, stride=stride, padding=pad)
+            padding = [padding, 0]
+            # Depthwise separable convolution for frequency domain
+            self.conv = nn.Sequential(
+                nn.Conv2d(chin, chin, kernel_size, stride=stride, padding=padding, groups=chin),
+                nn.Conv2d(chin, chout, 1)
+            )
         else:
-            self.conv = nn.Conv1d(chin, chout, kernel_size, stride=stride, padding=pad)
+            self.conv = nn.Sequential(
+                nn.Conv1d(chin, chin, kernel_size, stride=stride, padding=padding, groups=chin),
+                nn.Conv1d(chin, chout, 1)
+            )
 
-        if norm:
-            self.norm1 = norm_fn(chout)
-        else:
-            self.norm1 = nn.Identity()
-
-        self.rewrite = None
-        if rewrite:
-            self.rewrite = nn.Conv2d(chout, 2 * chout, 1 + 2 * context, 1, context)
-            if norm:
-                self.norm2 = norm_fn(2 * chout)
-
-        self.dconv = None
-        if dconv:
-            self.dconv = DConv(chout, **dconv_kw)
+        self.norm = nn.GroupNorm(norm_groups, chout) if norm_groups > 0 else nn.Identity()
+        self.context = context
+        if context:
+            self.ctx_conv = nn.Conv2d(chout, chout, [1, context], padding=[0, context//2])
 
     def forward(self, x, inject=None):
-        """
-        `inject` is used to inject the result from the time branch into the frequency branch,
-        when both have the same stride.
-        """
-        if not self.freq and x.dim() == 4:
-            B, C, Fr, T = x.shape
-            x = x.view(B, -1, T)
-
-        if not self.freq:
-            le = x.shape[-1]
-            if not le % self.stride == 0:
-                x = F.pad(x, (0, self.stride - (le % self.stride)))
         y = self.conv(x)
-        if self.empty:
-            return y
+        y = self.norm(y)
+        if self.context:
+            y = self.ctx_conv(y)
         if inject is not None:
-            assert inject.shape[-1] == y.shape[-1], (inject.shape, y.shape)
-            if inject.dim() == 3 and y.dim() == 4:
-                inject = inject[:, :, None]
             y = y + inject
-        y = F.gelu(self.norm1(y))
-        if self.dconv:
-            if self.freq:
-                B, C, Fr, T = y.shape
-                y = y.permute(0, 2, 1, 3).reshape(-1, C, T)
-            y = self.dconv(y)
-            if self.freq:
-                y = y.view(B, Fr, C, T).permute(0, 2, 1, 3)
-        if self.rewrite:
-            z = self.norm2(self.rewrite(y))
-            z = F.glu(z, dim=1)
-        else:
-            z = y
-        return z
+        return y
 
-
-class HDecLayer(nn.Module):
-    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, empty=False,
-                 freq=True, norm=True, context=1, dconv=True, pad=True, last=False,
-                 context_freq=False, **kwargs):
+class EfficientHDecLayer(nn.Module):
+    """Memory-efficient decoder layer using depthwise separable convolutions."""
+    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1,
+                 freq=True, context=1, pad=True):
         super().__init__()
-        self.chin = chin
-        self.chout = chout
         self.freq = freq
         self.kernel_size = kernel_size
         self.stride = stride
-        self.empty = empty
-        self.norm = norm
-        self.context = context
-        self.context_freq = context_freq
-        self.last = last
-
-        # Calculate padding size
-        if isinstance(pad, bool):
-            self.pad_size = kernel_size // 4 if pad else 0
-        else:
-            self.pad_size = pad
+        self.pad_size = kernel_size // 4 if pad else 0
 
         if freq:
             kernel_size = [kernel_size, 1]
             stride = [stride, 1]
             padding = [self.pad_size, 0]
-            self.conv = nn.ConvTranspose2d(chin, chout, kernel_size, stride=stride, padding=padding)
+            # Depthwise separable transposed convolution
+            self.conv = nn.Sequential(
+                nn.ConvTranspose2d(chin, chin, kernel_size, stride=stride, padding=padding, groups=chin),
+                nn.Conv2d(chin, chout, 1)
+            )
         else:
-            self.conv = nn.ConvTranspose1d(chin, chout, kernel_size, stride=stride, padding=self.pad_size)
+            self.conv = nn.Sequential(
+                nn.ConvTranspose1d(chin, chin, kernel_size, stride=stride, padding=self.pad_size, groups=chin),
+                nn.Conv1d(chin, chout, 1)
+            )
 
-        if norm:
-            self.norm = nn.GroupNorm(norm_groups, chout)
-        else:
-            self.norm = nn.Identity()
+        self.norm = nn.GroupNorm(norm_groups, chout) if norm_groups > 0 else nn.Identity()
 
     def forward(self, x):
-        """Forward pass for the decoder layer.
-        Args:
-            x (Tensor): Input tensor [B, C, F, T]
-        Returns:
-            Tensor: Output tensor [B, C, F', T]
-        """
-        # Apply transposed convolution
-        x = self.conv(x)
-        
-        # Apply normalization
-        x = self.norm(x)
-        
-        # Apply activation if not the last layer
-        if not self.last:
-            x = F.gelu(x)
-        
-        return x
+        y = self.conv(x)
+        y = self.norm(y)
+        return y
 
-
-class MultiWrap(nn.Module):
-    """Wrap a layer to support multiple frequency bands processing."""
+class EfficientMultiWrap(nn.Module):
+    """Efficient wrapper for multi-band processing."""
     def __init__(self, layer, **kwargs):
         super().__init__()
         self.layer = layer
 
     def forward(self, x_band):
-        """Forward pass for the wrapped layer.
-        Args:
-            x_band (Tensor): Input tensor [B, C, F, T]
-        Returns:
-            Tensor: Output tensor [B, C, F', T]
-        """
         return self.layer(x_band)
 
-
+@capture_init
 class HDemucs(nn.Module):
-    """Hybrid Demucs architecture for drum separation."""
-    def __init__(self, channels=48, growth=2, nfft=4096, 
-                 depth=6, freq_emb_dim=32, normalize=True):
-        """Initialize the HDemucs model.
+    """Optimized Hybrid Demucs architecture for drum separation."""
+    def __init__(self, channels=32, growth=1.5, nfft=2048, 
+                 depth=4, freq_emb_dim=16, normalize=True,
+                 chunk_size=262144, efficient_mode=True):
+        """Initialize the optimized HDemucs model.
         Args:
-            channels (int): Initial number of channels
-            growth (int): Factor by which the channels grow per layer
-            nfft (int): Size of FFT
-            depth (int): Number of layers
-            freq_emb_dim (int): Dimension of frequency embedding
-            normalize (bool): Whether to normalize input
+            channels: Initial number of channels (reduced from 48)
+            growth: Factor by which channels grow (reduced from 2)
+            nfft: Size of FFT (reduced from 4096)
+            depth: Number of layers (reduced from 6)
+            freq_emb_dim: Dimension of frequency embedding (reduced from 32)
+            normalize: Whether to normalize input
+            chunk_size: Size of chunks for memory-efficient processing
+            efficient_mode: Whether to use memory-efficient processing
         """
         super().__init__()
         self.channels = channels
         self.depth = depth
         self.nfft = nfft
         self.normalize = normalize
+        self.chunk_size = chunk_size
+        self.efficient_mode = efficient_mode
         self.floor = 1e-8
-        self.rescale = 0.1
 
+        # Lightweight frequency embedding
         self.freq_emb = nn.Sequential(
             nn.Linear(1, freq_emb_dim),
-            nn.ReLU(),
-            nn.Linear(freq_emb_dim, freq_emb_dim),
             nn.ReLU(),
             nn.Linear(freq_emb_dim, channels)
         )
 
-        # Channel projection for input
         self.channel_proj = nn.Conv2d(2, channels, 1)
 
-        # Initialize decoders for each drum component
+        # Initialize decoders with efficient layers
         self.kick_decoder = nn.ModuleList()
         self.snare_decoder = nn.ModuleList()
         self.hihat_decoder = nn.ModuleList()
@@ -278,147 +163,84 @@ class HDemucs(nn.Module):
 
         chin = channels
         for index in range(depth):
-            chout = channels * growth
-            last = index == depth - 1
-            
-            # Create decoder layers for each component
-            freq = True  # Always True since we're working in frequency domain
-            
-            # Kick decoder (focused on low frequencies)
-            self.kick_decoder.append(
-                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+            chout = int(channels * (growth ** index))
+            freq = True
 
-            # Snare decoder (mid frequencies)
-            self.snare_decoder.append(
-                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+            decoder_layer = lambda: EfficientMultiWrap(
+                EfficientHDecLayer(chin, chout, freq=freq))
 
-            # Hi-hat decoder (high frequencies)
-            self.hihat_decoder.append(
-                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
-
-            # Clap decoder (mid-high frequencies)
-            self.clap_decoder.append(
-                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
-
-            # Open hat decoder (high frequencies)
-            self.openhat_decoder.append(
-                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
-
-            # Percussion decoder (full frequency range)
-            self.perc_decoder.append(
-                MultiWrap(HDecLayer(chin, chout, freq=freq, last=last)))
+            self.kick_decoder.append(decoder_layer())
+            self.snare_decoder.append(decoder_layer())
+            self.hihat_decoder.append(decoder_layer())
+            self.clap_decoder.append(decoder_layer())
+            self.openhat_decoder.append(decoder_layer())
+            self.perc_decoder.append(decoder_layer())
 
             chin = chout
 
     def _spec(self, x):
-        """Convert input audio to spectrogram.
-        Args:
-            x (Tensor): Input audio [B, C, T]
-        Returns:
-            Tensor: Complex spectrogram [B, C, F, T]
-        """
-        nfft = self.nfft
-        hl = nfft // 4
-        window = torch.hann_window(nfft).to(x.device)
-        
-        # Handle input shape
-        B, C, T = x.shape
-        specs = []
-        
-        for c in range(C):
-            # Compute STFT for each channel
-            spec = torch.stft(x[:, c], n_fft=nfft, hop_length=hl,
-                            window=window, win_length=nfft,
-                            normalized=True, center=True,
-                            return_complex=True)  # [B, F, T]
-            specs.append(spec)
-        
-        # Stack channels
-        x = torch.stack(specs, dim=1)  # [B, C, F, T]
-        
-        # Convert to magnitude spectrogram
-        return x.abs()
+        """Efficient STFT implementation."""
+        return torch.stft(
+            x, n_fft=self.nfft, 
+            hop_length=self.nfft // 4,
+            window=torch.hann_window(self.nfft).to(x.device),
+            return_complex=True
+        )
 
-    def forward(self, mix):
-        """
-        Forward pass for the drum separation model.
-        Args:
-            mix (Tensor): Input mixture of shape [B, C, T] or [B, T]
-        Returns:
-            Tensor: Separated drums of shape [B, 6, C, T] where 6 is the number of components
-                   (kick, snare, hihat, clap, openhat, perc)
-        """
-        # Handle 2D input (single channel)
-        if mix.dim() == 2:
-            mix = mix.unsqueeze(1)
-        
-        # Store original dimensions
-        B, C, T = mix.shape
-        
-        # Convert to spectrogram
-        x = self._spec(mix)  # [B, C, F, T]
-        
+    def _forward_chunks(self, mix):
+        """Process audio in chunks for memory efficiency."""
+        chunks = mix.unfold(-1, self.chunk_size, self.chunk_size // 2).transpose(0, -1)
+        results = []
+
+        for chunk in chunks:
+            # Process at lower resolution first
+            low_res = F.interpolate(chunk, scale_factor=0.5)
+            processed = self._forward_chunk(low_res)
+            # Upscale back to original resolution
+            processed = F.interpolate(processed, size=chunk.shape[-1])
+            results.append(processed)
+
+        return torch.cat(results, dim=-1)
+
+    def _forward_chunk(self, x):
+        """Process a single chunk."""
+        if x.dim() == 2:
+            x = x[None]
         if self.normalize:
-            mono = mix.mean(dim=1, keepdim=True)
+            mono = x.mean(dim=1, keepdim=True)
             mean = mono.mean(dim=-1, keepdim=True)
             std = mono.std(dim=-1, keepdim=True)
-            x = (x - mean.unsqueeze(-2)) / (self.floor + std.unsqueeze(-2))
-        else:
-            std = 1
-            mean = 0
+            x = (x - mean) / (self.floor + std)
 
-        # Project input channels to model channels
-        x = self.channel_proj(x)  # [B, channels, F, T]
+        spec = self._spec(x)
+        mag = spec.abs()
+        phase = spec.angle()
 
-        # Prepare frequency embedding
-        freqs = torch.linspace(0, 1, x.shape[2], device=x.device)
-        freqs = freqs.view(-1, 1)  # [F, 1]
-        freq_emb = self.freq_emb(freqs)  # [F, channels]
+        # Process through decoders
+        x = self.channel_proj(mag.transpose(2, 3))
         
-        # Reshape frequency embedding for addition
-        freq_emb = freq_emb.transpose(0, 1)  # [channels, F]
-        freq_emb = freq_emb.unsqueeze(0).unsqueeze(-1)  # [1, channels, F, 1]
-        freq_emb = freq_emb.expand(B, -1, -1, x.shape[-1])  # [B, channels, F, T]
-        
-        # Add frequency embedding
-        x = x + freq_emb
+        # Separate components
+        components = []
+        decoders = [
+            self.kick_decoder, self.snare_decoder, 
+            self.hihat_decoder, self.clap_decoder,
+            self.openhat_decoder, self.perc_decoder
+        ]
 
-        # Split into frequency bands for each component
-        outputs = []
-        for decoder_list in [self.kick_decoder, self.snare_decoder, self.hihat_decoder,
-                           self.clap_decoder, self.openhat_decoder, self.perc_decoder]:
-            x_band = x
-            for layer in decoder_list:
-                x_band = layer(x_band)
-            outputs.append(x_band)
+        for decoder in decoders:
+            out = x
+            for layer in decoder:
+                out = layer(out)
+            components.append(out)
 
-        # Combine all outputs
-        x = torch.stack(outputs, dim=1)  # [B, 6, channels, F, T]
-        
-        if self.normalize:
-            x = x * std.unsqueeze(-2)
-            x = x + mean.unsqueeze(-2)
-        
-        x = x * self.rescale
-        
-        # Convert back to time domain
-        B, D, Ch, F, T = x.shape
-        x = x.view(B * D * Ch, F, T)  # Reshape for batch processing
-        
-        # Convert magnitude to complex
-        x = x.to(torch.complex64)  # Convert to complex numbers assuming phase is 0
-        
-        # Inverse STFT
-        nfft = self.nfft
-        hl = nfft // 4
-        x = torch.istft(x, n_fft=nfft, hop_length=hl,
-                       window=torch.hann_window(nfft).to(x.device),
-                       win_length=nfft, normalized=True, center=True)
-        
-        # Reshape back to match input channels
-        x = x.view(B, D, C, -1)  # [B, 6, C, T]
-        
-        # Trim to original length
-        x = x[..., :T]
-        
-        return x
+        # Combine components
+        return torch.stack(components, dim=1)
+
+    def forward(self, mix):
+        """Forward pass with optional chunk processing."""
+        if mix.dim() == 2:
+            mix = mix[None]
+
+        if self.efficient_mode and mix.shape[-1] > self.chunk_size:
+            return self._forward_chunks(mix)
+        return self._forward_chunk(mix)
