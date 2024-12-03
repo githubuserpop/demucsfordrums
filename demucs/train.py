@@ -10,14 +10,14 @@ import logging
 import os
 import sys
 from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.cuda.amp as amp
+import torchaudio
 
 from dora import hydra_main, get_xp
 import hydra
 from omegaconf import OmegaConf
-import torch
-from torch import nn
-import torchaudio
-from torch.utils.data import ConcatDataset
 
 from . import distrib
 from .wav import get_wav_datasets, get_musdb_wav_datasets
@@ -29,6 +29,7 @@ from .solver import Solver
 from .states import capture_init
 from .utils import random_subset
 from .drum_datasets import get_drum_datasets, DrumDataset
+from .drum_losses import DrumPatternLoss
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,73 @@ class TorchHDemucsWrapper(nn.Module):
         return self.torch_hdemucs(mix)
 
 
+class DrumPatternWrapper(nn.Module):
+    """Memory-efficient wrapper for drum pattern recognition."""
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+        # Reduced channel dimensions for memory efficiency
+        self.pattern_heads = nn.ModuleDict({
+            source: nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=7, padding=3, stride=2),  # Reduced channels and kernel
+                nn.BatchNorm1d(32),  # Added BatchNorm for better training stability
+                nn.ReLU(),
+                nn.Conv1d(32, 16, kernel_size=5, padding=2, stride=2),  # Added stride for downsampling
+                nn.BatchNorm1d(16),
+                nn.ReLU(),
+                nn.Conv1d(16, 1, kernel_size=3, padding=1),
+                nn.Sigmoid()  # Added sigmoid for pattern probability
+            ) for source in base_model.sources
+        })
+        
+    @torch.cuda.amp.autocast()  # Use automatic mixed precision
+    def forward(self, mix):
+        """Forward pass with memory-efficient processing."""
+        # Get the primary source separation output
+        sources = self.base_model(mix)
+        
+        # Process patterns in chunks if the audio is long
+        if sources.shape[-1] > 44100 * 10:  # If longer than 10 seconds
+            patterns = self._chunked_pattern_recognition(sources)
+        else:
+            patterns = self._single_pattern_recognition(sources)
+            
+        return sources, patterns
+    
+    @torch.cuda.amp.autocast()
+    def _single_pattern_recognition(self, sources):
+        """Process patterns for shorter audio segments."""
+        patterns = {}
+        for idx, source in enumerate(self.base_model.sources):
+            source_audio = sources[:, idx:idx+1]
+            # Normalize input to pattern recognition
+            source_audio = source_audio / (torch.max(torch.abs(source_audio)) + 1e-8)
+            patterns[source] = self.pattern_heads[source](source_audio)
+        return patterns
+    
+    @torch.cuda.amp.autocast()
+    def _chunked_pattern_recognition(self, sources, chunk_size=44100*5):
+        """Process patterns in chunks for longer audio."""
+        patterns = {source: [] for source in self.base_model.sources}
+        chunks = sources.shape[-1] // chunk_size + (1 if sources.shape[-1] % chunk_size else 0)
+        
+        for i in range(chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, sources.shape[-1])
+            
+            # Process each source in the current chunk
+            for idx, source in enumerate(self.base_model.sources):
+                source_audio = sources[:, idx:idx+1, start_idx:end_idx]
+                # Normalize input to pattern recognition
+                source_audio = source_audio / (torch.max(torch.abs(source_audio)) + 1e-8)
+                chunk_pattern = self.pattern_heads[source](source_audio)
+                patterns[source].append(chunk_pattern)
+        
+        # Concatenate chunks for each source
+        return {source: torch.cat(pattern_chunks, dim=-1) 
+               for source, pattern_chunks in patterns.items()}
+
+
 def get_model(args):
     """Initializes the model based on specified configuration."""
     extra = {
@@ -61,6 +129,8 @@ def get_model(args):
         'audio_channels': args.dset.channels,
         'samplerate': args.dset.samplerate,
         'segment': args.model_segment or 4 * args.dset.segment,
+        'use_pattern_recognition': args.model.get('use_pattern_recognition', True),
+        'drum_specific_layers': args.model.get('drum_specific_layers', True)
     }
     klass = {
         'demucs': Demucs,
@@ -72,7 +142,12 @@ def get_model(args):
         raise ValueError(f"Model type '{args.model}' is not recognized.")
     
     kw = OmegaConf.to_container(getattr(args, args.model), resolve=True)
-    return klass(**extra, **kw)
+    model = klass(**extra, **kw)
+    
+    if args.model == 'hdemucs' and extra['use_pattern_recognition']:
+        model = DrumPatternWrapper(model)
+    
+    return model
 
 
 def get_optimizer(model, args):
@@ -110,14 +185,14 @@ def get_datasets(args):
     train_set, valid_set = (get_musdb_wav_datasets(args.dset) if args.dset.use_musdb else ([], []))
     if args.dset.wav:
         extra_train_set, extra_valid_set = get_wav_datasets(args.dset)
-        train_set, valid_set = ConcatDataset([train_set, extra_train_set]), ConcatDataset([valid_set, extra_valid_set])
+        train_set, valid_set = torch.utils.data.ConcatDataset([train_set, extra_train_set]), torch.utils.data.ConcatDataset([valid_set, extra_valid_set])
 
     if args.dset.wav2:
         extra_train_set, extra_valid_set = get_wav_datasets(args.dset, "wav2")
         reps = max(1, round(len(extra_train_set) / len(train_set) * (1 / args.dset.wav2_weight - 1))) if args.dset.wav2_weight else 1
-        train_set = ConcatDataset([train_set] * reps + [extra_train_set])
+        train_set = torch.utils.data.ConcatDataset([train_set] * reps + [extra_train_set])
         if args.dset.wav2_valid and args.dset.wav2_weight:
-            valid_set = ConcatDataset([valid_set, random_subset(extra_valid_set, int(round(args.dset.wav2_weight * len(valid_set) / (1 - args.dset.wav2_weight))))])
+            valid_set = torch.utils.data.ConcatDataset([valid_set, random_subset(extra_valid_set, int(round(args.dset.wav2_weight * len(valid_set) / (1 - args.dset.wav2_weight))))])
 
     if args.dset.valid_samples:
         valid_set = random_subset(valid_set, args.dset.valid_samples)
@@ -159,33 +234,47 @@ def get_drum_datasets(args):
 
 
 def get_solver(args, model_only=False):
-    distrib.init()
-    torch.manual_seed(args.seed)
-    model = get_model(args)
-    
-    if args.misc.show:
-        logger.info(model)
-        logger.info(f'Size: {sum(p.numel() for p in model.parameters()) * 4 / 2**20:.1f} MB')
-        if hasattr(model, 'valid_length'):
-            logger.info(f'Field: {model.valid_length(1) / args.dset.samplerate * 1000:.1f} ms')
-        sys.exit(0)
-
-    if torch.cuda.is_available():
-        model = model.to(torch.device("cuda"))
-
-    optimizer = get_optimizer(model, args)
-    args.batch_size //= distrib.world_size
-
+    """Creates the solver for training the model."""
     if model_only:
-        return Solver(None, model, optimizer, args)
+        return get_model(args)
 
+    # Initialize model and optimizer with proper device placement
+    model = get_model(args)
+    if torch.cuda.is_available():
+        model = model.cuda()
+    optimizer = get_optimizer(model, args)
+
+    # Get training and validation datasets
     train_set, valid_set = get_datasets(args)
-    train_loader = distrib.loader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.misc.num_workers, drop_last=True)
-    valid_loader = distrib.loader(valid_set, batch_size=1 if args.dset.full_cv else args.batch_size, shuffle=False, num_workers=args.misc.num_workers, drop_last=not args.dset.full_cv)
-    loaders = {"train": train_loader, "valid": valid_loader}
+    loaders = {}
+    
+    if train_set is not None:
+        loaders['train'] = distrib.loader(
+            train_set, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.misc.num_workers, drop_last=True)
+    if valid_set is not None:
+        loaders['valid'] = distrib.loader(
+            valid_set, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.misc.num_workers, drop_last=True)
 
-    logger.info(f"Train/valid set sizes: {len(train_set)}, {len(valid_set)}")
-    return Solver(loaders, model, optimizer, args)
+    # Initialize the solver
+    solver = Solver(loaders, model, optimizer, args)
+    
+    # Add drum-specific loss components if using pattern recognition
+    if hasattr(model, 'pattern_heads'):
+        solver.pattern_loss = DrumPatternLoss(
+            alpha=args.loss.get('pattern_weight', 0.3),
+            use_onset_loss=args.loss.get('use_onset_loss', True),
+            use_pattern_loss=args.loss.get('use_pattern_loss', True)
+        )
+        if torch.cuda.is_available():
+            solver.pattern_loss = solver.pattern_loss.cuda()
+    
+    # Set up mixed precision training if available
+    if torch.cuda.is_available():
+        solver.scaler = torch.cuda.amp.GradScaler()
+    
+    return solver
 
 
 def load_custom_data(training_folders, batch_size):
