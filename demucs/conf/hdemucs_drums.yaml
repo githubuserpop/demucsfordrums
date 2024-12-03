@@ -1,0 +1,98 @@
+# Configuration for drum-specific HDemucs model
+defaults:
+  - hydra/job_logging: colorlog
+  - hydra/hydra_logging: colorlog
+
+# Model configuration
+model: hdemucs
+segment: 44  # segment length in seconds
+batch_size: 32  # reduced from 64 to handle pattern recognition memory requirements
+epochs: 360
+lr: 3e-4
+
+# Dataset configuration
+dset:
+  sources: ["kick", "snare", "hihat", "toms", "cymbals", "percussion"]
+  channels: 2
+  samplerate: 44100
+  segment: 44
+  stride: 1
+  use_drums: true
+  normalize: true
+  sample_ratio: 0.5
+  
+  # Data paths
+  sample_dirs: 
+    - "/DATA/Training Data/organized drums"
+  stem_dirs:
+    - "/DATA/Training Data/beat stems"
+    - "/DATA/Training Data/song drum stems"
+
+# HDemucs specific settings
+hdemucs:
+  # Base architecture
+  channels: 48
+  growth: 2
+  depth: 6
+  kernel_size: 8
+  stride: 4
+  context: 3
+  
+  # Drum-specific features
+  use_pattern_recognition: true
+  drum_specific_layers: true
+  
+  # Pattern recognition settings
+  pattern_channels: 32
+  pattern_kernel_size: 15
+  pattern_stride: 4
+
+# Loss configuration
+loss:
+  pattern_weight: 0.3
+  use_onset_loss: true
+  use_pattern_loss: true
+  
+  # Source-specific weights
+  source_weights:
+    kick: 1.0
+    snare: 1.0
+    hihat: 1.0
+    toms: 1.0
+    cymbals: 0.8
+    percussion: 0.8
+
+# Optimizer settings
+optim:
+  optimizer: adam
+  lr: 3e-4
+  momentum: 0.9
+  beta2: 0.999
+  weight_decay: 1e-6
+  
+  # Learning rate scheduling
+  scheduler:
+    type: reduce_on_plateau
+    patience: 5
+    factor: 0.5
+    threshold: 0.01
+
+# Training settings
+misc:
+  num_workers: 8
+  show: false
+  seed: 42
+  
+# Augmentation settings
+augment:
+  shift: true
+  shift_same: true
+  flip: true
+  scale:
+    proba: 0.3
+    min: 0.25
+    max: 1.25
+  remix:
+    proba: 0.3
+    min: 0.1
+    max: 0.5
