@@ -113,10 +113,48 @@ class EfficientMultiWrap(nn.Module):
     """Efficient wrapper for multi-band processing."""
     def __init__(self, layer, **kwargs):
         super().__init__()
+        if not isinstance(layer, nn.Module):
+            raise TypeError("Layer must be a PyTorch Module")
+        
+        # Validate that the layer has expected attributes
+        if not hasattr(layer, 'forward'):
+            raise AttributeError("Layer must have a forward method")
+            
+        # Store original layer dimensions if available
+        self.in_channels = getattr(layer, 'in_channels', None)
+        self.out_channels = getattr(layer, 'out_channels', None)
+        
         self.layer = layer
 
     def forward(self, x_band):
-        return self.layer(x_band)
+        # Input validation
+        if not isinstance(x_band, torch.Tensor):
+            raise TypeError("Input must be a torch.Tensor")
+            
+        if x_band.dim() not in [3, 4]:  # Allow both 3D and 4D tensors
+            raise ValueError(f"Expected 3D or 4D tensor, got {x_band.dim()}D")
+            
+        # Check input channels if known
+        if self.in_channels is not None:
+            if x_band.size(1) != self.in_channels:
+                raise ValueError(f"Expected {self.in_channels} input channels, got {x_band.size(1)}")
+        
+        try:
+            output = self.layer(x_band)
+            
+            # Validate output
+            if not isinstance(output, torch.Tensor):
+                raise TypeError("Layer output must be a torch.Tensor")
+                
+            # Check output channels if known
+            if self.out_channels is not None:
+                if output.size(1) != self.out_channels:
+                    raise ValueError(f"Expected {self.out_channels} output channels, got {output.size(1)}")
+                    
+            return output
+            
+        except Exception as e:
+            raise RuntimeError(f"Error in EfficientMultiWrap forward pass: {str(e)}")
 
 @capture_init
 class HDemucs(nn.Module):
@@ -166,8 +204,18 @@ class HDemucs(nn.Module):
             chout = int(channels * (growth ** index))
             freq = True
 
-            decoder_layer = lambda: EfficientMultiWrap(
-                EfficientHDecLayer(chin, chout, freq=freq))
+            def create_decoder_layer(chin, chout, freq):
+                try:
+                    dec_layer = EfficientHDecLayer(chin, chout, freq=freq)
+                    # Store channel information for validation
+                    dec_layer.in_channels = chin
+                    dec_layer.out_channels = chout
+                    return EfficientMultiWrap(dec_layer)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to create decoder layer: {str(e)}")
+
+            # Create decoder layers with proper error handling
+            decoder_layer = lambda: create_decoder_layer(chin, chout, freq)
 
             self.kick_decoder.append(decoder_layer())
             self.snare_decoder.append(decoder_layer())
