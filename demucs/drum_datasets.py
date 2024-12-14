@@ -148,3 +148,49 @@ class DrumDataset(Dataset):
                     targets[source] = targets[source] / mix_std
         
         return mix, targets
+
+def get_drum_datasets(args):
+    """Create train and valid datasets for drum separation."""
+    # Get dataset paths from config
+    sample_dirs = args.dset.get('sample_dirs', [])
+    stem_dirs = args.dset.get('stem_dirs', [])
+    
+    if not sample_dirs or not stem_dirs:
+        raise ValueError("No dataset paths provided in config. Please add 'sample_dirs' and 'stem_dirs' to dset config.")
+    
+    # Verify paths exist
+    sample_dirs = [d for d in sample_dirs if os.path.exists(d)]
+    stem_dirs = [d for d in stem_dirs if os.path.exists(d)]
+    
+    if not sample_dirs or not stem_dirs:
+        raise ValueError("No valid dataset paths found. Please check the paths in config.")
+    
+    # Split directories for training and validation
+    train_sample_dirs = sample_dirs[:-1]
+    train_stem_dirs = stem_dirs[:-1]
+    valid_sample_dirs = sample_dirs[-1:]
+    valid_stem_dirs = stem_dirs[-1:]
+    
+    train_dataset = DrumDataset(
+        sample_dirs=train_sample_dirs,
+        stem_dirs=train_stem_dirs,
+        sources=args.dset.sources,
+        sample_rate=args.dset.samplerate,
+        segment_duration=args.dset.segment,
+        channels=args.dset.channels,
+        normalize=args.dset.normalize,
+        sample_ratio=args.dset.sample_ratio
+    )
+    
+    valid_dataset = DrumDataset(
+        sample_dirs=valid_sample_dirs,
+        stem_dirs=valid_stem_dirs,
+        sources=args.dset.sources,
+        sample_rate=args.dset.samplerate,
+        segment_duration=args.dset.segment,
+        channels=args.dset.channels,
+        normalize=args.dset.normalize,
+        sample_ratio=args.dset.sample_ratio
+    )
+    
+    return train_dataset, valid_dataset
