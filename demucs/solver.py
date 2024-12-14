@@ -20,7 +20,7 @@ from .evaluate import evaluate, new_sdr
 from .svd import svd_penalty
 from .drum_losses import DrumPatternLoss
 from .utils import pull_metric, EMA
-from .train import load_custom_data  # Import the custom data loading function
+from .data_utils import load_custom_data  # Updated import
 
 logger = logging.getLogger(__name__)
 

@@ -124,28 +124,18 @@ class DrumPatternWrapper(nn.Module):
 
 
 def get_model(args):
-    """Initializes the model based on specified configuration."""
-    extra = {
-        'sources': list(args.dset.sources),
-        'audio_channels': args.dset.channels,
-        'samplerate': args.dset.samplerate,
-        'segment': args.model_segment or 4 * args.dset.segment,
-        'use_pattern_recognition': args.model.get('use_pattern_recognition', True),
-        'drum_specific_layers': args.model.get('drum_specific_layers', True)
-    }
-    klass = {
-        'demucs': Demucs,
-        'hdemucs': HDemucs,
-        'htdemucs': HTDemucs,
-        'torch_hdemucs': TorchHDemucsWrapper,
-    }.get(args.model)
-    if klass is None:
-        raise ValueError(f"Model type '{args.model}' is not recognized.")
+    """Initialize model based on configuration."""
+    if args.model.name == "hdemucs":
+        model = HDemucs(
+            channels=getattr(args.model, 'channels', 32),
+            growth=getattr(args.model, 'growth', 1.5),
+            depth=getattr(args.model, 'depth', 4),
+            normalize=getattr(args.model, 'normalize', True)
+        )
+    else:
+        raise ValueError(f"Invalid model name: {args.model.name}")
     
-    kw = OmegaConf.to_container(getattr(args, args.model), resolve=True)
-    model = klass(**extra, **kw)
-    
-    if args.model == 'hdemucs' and extra['use_pattern_recognition']:
+    if args.model.use_pattern_recognition:
         model = DrumPatternWrapper(model)
     
     return model
