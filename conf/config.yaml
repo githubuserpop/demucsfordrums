@@ -8,13 +8,20 @@ defaults:
 
 dummy:
 dset:
+  backend: musdb
   musdb: /checkpoint/defossez/datasets/musdbhq
   musdb_samplerate: 44100
-  use_musdb: false   # Changed to false
-  use_drums: true    # Add this line
-  wav:  # path to custom wav dataset
-  wav2:  # second custom wav dataset
-  segment: 4         # Changed from 11 to 4
+  use_musdb: false
+  use_drums: true
+  sample_dirs:
+    - /DATA/Training Data/organized drums
+    - /DATA/Training Data/beat stems
+    - /DATA/Training Data/song drum stems
+  stem_dirs:
+    - /DATA/Training Data/organized drums
+    - /DATA/Training Data/beat stems
+    - /DATA/Training Data/song drum stems
+  segment: 4
   shift: 1
   train_valid: false
   full_cv: true
@@ -22,9 +29,9 @@ dset:
   channels: 2
   normalize: true
   metadata: ./metadata
-  sources: ['kicks', 'snares', 'claps', 'hi hats', 'open hats', 'percs']  # Changed sources
-  sample_ratio: 0.3  # Add this line
-
+  sources: ['kicks', 'snares', 'claps', 'hi hats', 'open hats', 'percs']
+  sample_ratio: 0.3
+  valid_samples: 100
 test:
   save: False
   best: True
@@ -90,8 +97,42 @@ ema:
   batch: []
 
 use_train_segment: true  # to remove
-model_segment:  # override the segment parameter for the model, usually 4 times the training segment.
-model: hdemucs  # see demucs/train.py for the possibilities, and config for each model hereafter.
+model:
+  name: hdemucs
+  use_pattern_recognition: true
+  channels: 48
+  channels_time:
+  growth: 2
+  # Main structure
+  depth: 6
+  rewrite: true
+  # Frequency Branch
+  multi_freqs: []
+  multi_freqs_depth: 3
+  freq_emb: 0.2
+  emb_scale: 10
+  emb_smooth: true
+  # Convolutions
+  kernel_size: 8
+  stride: 4
+  time_stride: 2
+  context: 3
+  context_enc: 0
+  # normalization
+  norm_starts: 4
+  norm_groups: 4
+  # DConv residual branch
+  dconv_mode: 1
+  dconv_depth: 2
+  dconv_comp: 4
+  dconv_attn: 4
+  dconv_lstm: 4
+  dconv_init: 1e-3
+  # Weight init
+  rescale: 0.1
+  normalize: true
+  resample: true
+
 demucs:  # see demucs/demucs.py for a detailed description
   # Channels
   channels: 64
