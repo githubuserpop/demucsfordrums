@@ -7,11 +7,11 @@
 import math
 import typing as tp
 
-import julius
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+import julius
 from .states import capture_init
 from .utils import center_trim, unfold
 from .transformer import LayerScale

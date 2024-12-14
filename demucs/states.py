@@ -6,41 +6,47 @@
 """
 Utilities to save and load models.
 """
+import functools
+import typing as tp
+from pathlib import Path
 from contextlib import contextmanager
 
-import functools
+import torch
+from .utils import capture_init
+from omegaconf import OmegaConf
+from .log import fatal
 import hashlib
 import inspect
 import io
-from pathlib import Path
 import warnings
-
-from omegaconf import OmegaConf
-from dora.log import fatal
-import torch
 
 
 def _check_diffq():
     try:
         import diffq  # noqa
+        return True
     except ImportError:
-        fatal('Trying to use DiffQ, but diffq is not installed.\n'
-              'On Windows run: python.exe -m pip install diffq \n'
-              'On Linux/Mac, run: python3 -m pip install diffq')
+        return False
 
 
 def get_quantizer(model, args, optimizer=None):
     """Return the quantizer given the XP quantization args."""
     quantizer = None
     if args.diffq:
-        _check_diffq()
+        if not _check_diffq():
+            fatal('Trying to use DiffQ, but diffq is not installed.\n'
+                  'On Windows run: python.exe -m pip install diffq \n'
+                  'On Linux/Mac, run: python3 -m pip install diffq')
         from diffq import DiffQuantizer
         quantizer = DiffQuantizer(
             model, min_size=args.min_size, group_size=args.group_size)
         if optimizer is not None:
             quantizer.setup_optimizer(optimizer)
     elif args.qat:
-        _check_diffq()
+        if not _check_diffq():
+            fatal('Trying to use DiffQ, but diffq is not installed.\n'
+                  'On Windows run: python.exe -m pip install diffq \n'
+                  'On Linux/Mac, run: python3 -m pip install diffq')
         from diffq import UniformQuantizer
         quantizer = UniformQuantizer(
                 model, bits=args.qat, min_size=args.min_size)
@@ -99,7 +105,10 @@ def set_state(model, state, quantizer=None):
         if quantizer is not None:
             quantizer.restore_quantized_state(model, state['quantized'])
         else:
-            _check_diffq()
+            if not _check_diffq():
+                fatal('Trying to use DiffQ, but diffq is not installed.\n'
+                      'On Windows run: python.exe -m pip install diffq \n'
+                      'On Linux/Mac, run: python3 -m pip install diffq')
             from diffq import restore_quantized_state
             restore_quantized_state(model, state)
     else:
@@ -140,8 +149,7 @@ def copy_state(state):
 def swap_state(model, state):
     """
     Context manager that swaps the state of a model, e.g:
-
-        # model is in old state
+        # model in old state
         with swap_state(model, new_state):
             # model in new state
         # model back to old state
@@ -152,12 +160,3 @@ def swap_state(model, state):
         yield
     finally:
         model.load_state_dict(old_state)
-
-
-def capture_init(init):
-    @functools.wraps(init)
-    def __init__(self, *args, **kwargs):
-        self._init_args_kwargs = (args, kwargs)
-        init(self, *args, **kwargs)
-
-    return __init__
