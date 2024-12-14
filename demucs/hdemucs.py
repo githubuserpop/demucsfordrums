@@ -156,24 +156,88 @@ class EfficientMultiWrap(nn.Module):
         except Exception as e:
             raise RuntimeError(f"Error in EfficientMultiWrap forward pass: {str(e)}")
 
-@capture_init
+class HEncLayer(nn.Module):
+    """Hybrid encoder layer."""
+    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, freq=True):
+        super().__init__()
+        self.freq = freq
+        self.kernel_size = kernel_size
+        self.stride = stride
+        padding = kernel_size // 4
+
+        if freq:
+            self.conv = nn.Conv2d(chin, chout, kernel_size=(kernel_size, 1), 
+                                stride=(stride, 1), padding=(padding, 0))
+        else:
+            self.conv = nn.Conv1d(chin, chout, kernel_size, 
+                                stride=stride, padding=padding)
+        
+        self.norm = nn.GroupNorm(norm_groups, chout) if norm_groups > 0 else nn.Identity()
+        self.act = nn.GLU(1) if freq else nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
+
+class MultiWrap(nn.Module):
+    """Wrapper for handling multiple band processing."""
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, x):
+        B, C, Fr, T = x.shape
+        x = x.view(-1, 1, Fr, T)
+        x = self.module(x)
+        x = x.view(B, -1, x.shape[-2], x.shape[-1])
+        return x
+
+class HDecLayer(nn.Module):
+    """Hybrid decoder layer."""
+    def __init__(self, chin, chout, kernel_size=8, stride=4, norm_groups=1, 
+                 freq=True, context=1):
+        super().__init__()
+        self.freq = freq
+        self.kernel_size = kernel_size
+        self.stride = stride
+        padding = kernel_size // 4
+
+        if freq:
+            self.conv = nn.ConvTranspose2d(chin, chout, kernel_size=(kernel_size, 1),
+                                         stride=(stride, 1), padding=(padding, 0))
+        else:
+            self.conv = nn.ConvTranspose1d(chin, chout, kernel_size,
+                                         stride=stride, padding=padding)
+        
+        self.norm = nn.GroupNorm(norm_groups, chout) if norm_groups > 0 else nn.Identity()
+        self.act = nn.GLU(1) if freq else nn.ReLU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
+
+class ScaledEmbedding(nn.Module):
+    """Efficient scaled embedding layer."""
+    def __init__(self, num_embeddings: int, embedding_dim: int, scale: float = 1.):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.scale = scale
+
+    def forward(self, x):
+        out = self.embedding(x)
+        return out * self.scale
+
 class HDemucs(nn.Module):
     """Optimized Hybrid Demucs architecture for drum separation."""
     def __init__(self, channels=32, growth=1.5, nfft=2048, 
                  depth=4, freq_emb_dim=16, normalize=True,
                  chunk_size=262144, efficient_mode=True):
-        """Initialize the optimized HDemucs model.
-        Args:
-            channels: Initial number of channels (reduced from 48)
-            growth: Factor by which channels grow (reduced from 2)
-            nfft: Size of FFT (reduced from 4096)
-            depth: Number of layers (reduced from 6)
-            freq_emb_dim: Dimension of frequency embedding (reduced from 32)
-            normalize: Whether to normalize input
-            chunk_size: Size of chunks for memory-efficient processing
-            efficient_mode: Whether to use memory-efficient processing
-        """
-        super().__init__()
+        """Initialize the optimized HDemucs model."""
+        super(HDemucs, self).__init__()
         self.channels = channels
         self.depth = depth
         self.nfft = nfft
@@ -181,6 +245,7 @@ class HDemucs(nn.Module):
         self.chunk_size = chunk_size
         self.efficient_mode = efficient_mode
         self.floor = 1e-8
+        self.sources = ['drums']  # For drum separation
 
         # Lightweight frequency embedding
         self.freq_emb = nn.Sequential(
@@ -226,69 +291,74 @@ class HDemucs(nn.Module):
 
             chin = chout
 
-    def _spec(self, x):
-        """Efficient STFT implementation."""
-        return torch.stft(
-            x, n_fft=self.nfft, 
-            hop_length=self.nfft // 4,
-            window=torch.hann_window(self.nfft).to(x.device),
-            return_complex=True
-        )
-
-    def _forward_chunks(self, mix):
-        """Process audio in chunks for memory efficiency."""
-        chunks = mix.unfold(-1, self.chunk_size, self.chunk_size // 2).transpose(0, -1)
-        results = []
-
-        for chunk in chunks:
-            # Process at lower resolution first
-            low_res = F.interpolate(chunk, scale_factor=0.5)
-            processed = self._forward_chunk(low_res)
-            # Upscale back to original resolution
-            processed = F.interpolate(processed, size=chunk.shape[-1])
-            results.append(processed)
-
-        return torch.cat(results, dim=-1)
-
-    def _forward_chunk(self, x):
-        """Process a single chunk."""
-        if x.dim() == 2:
-            x = x[None]
-        if self.normalize:
-            mono = x.mean(dim=1, keepdim=True)
-            mean = mono.mean(dim=-1, keepdim=True)
-            std = mono.std(dim=-1, keepdim=True)
-            x = (x - mean) / (self.floor + std)
-
-        spec = self._spec(x)
-        mag = spec.abs()
-        phase = spec.angle()
-
-        # Process through decoders
-        x = self.channel_proj(mag.transpose(2, 3))
-        
-        # Separate components
-        components = []
-        decoders = [
-            self.kick_decoder, self.snare_decoder, 
-            self.hihat_decoder, self.clap_decoder,
-            self.openhat_decoder, self.perc_decoder
-        ]
-
-        for decoder in decoders:
-            out = x
-            for layer in decoder:
-                out = layer(out)
-            components.append(out)
-
-        # Combine components
-        return torch.stack(components, dim=1)
-
     def forward(self, mix):
         """Forward pass with optional chunk processing."""
-        if mix.dim() == 2:
-            mix = mix[None]
-
         if self.efficient_mode and mix.shape[-1] > self.chunk_size:
             return self._forward_chunks(mix)
         return self._forward_chunk(mix)
+
+    def _forward_chunk(self, x):
+        """Process a single chunk."""
+        # Apply STFT
+        spec = self._spec(x)
+        B, C, Fr, T = spec.shape
+
+        # Apply frequency embedding
+        freq_emb = torch.linspace(0, 1, Fr, device=x.device).view(1, 1, -1, 1)
+        freq_emb = self.freq_emb(freq_emb)
+        spec = spec + freq_emb
+
+        # Project to model channels
+        x = self.channel_proj(spec)
+
+        # Process through decoders
+        outputs = {}
+        decoders = {
+            'kicks': self.kick_decoder,
+            'snares': self.snare_decoder,
+            'hi_hats': self.hihat_decoder,
+            'claps': self.clap_decoder,
+            'open_hats': self.openhat_decoder,
+            'percs': self.perc_decoder
+        }
+
+        for name, decoder in decoders.items():
+            out = x
+            for layer in decoder:
+                out = layer(out)
+            outputs[name] = out
+
+        return outputs
+
+    def _forward_chunks(self, mix):
+        """Process audio in chunks for memory efficiency."""
+        chunk_size = self.chunk_size
+        chunks = mix.unfold(-1, chunk_size, chunk_size // 2)
+        results = []
+
+        for chunk in chunks.transpose(0, -1):
+            with torch.no_grad():
+                result = self._forward_chunk(chunk)
+            results.append(result)
+
+        # Combine chunks
+        output = {}
+        for key in results[0].keys():
+            chunks = torch.stack([r[key] for r in results], dim=-1)
+            output[key] = chunks.mean(dim=-1)
+
+        return output
+
+    def _spec(self, x):
+        """Efficient STFT implementation."""
+        spec = torch.stft(
+            x, 
+            n_fft=self.nfft,
+            hop_length=self.nfft // 4,
+            window=torch.hann_window(self.nfft, device=x.device),
+            return_complex=True
+        )
+        spec = torch.abs(spec)
+        if self.normalize:
+            spec = spec / (spec.mean() + self.floor)
+        return spec
