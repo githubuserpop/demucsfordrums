@@ -3,7 +3,7 @@ import torchaudio
 import os
 import random
 from pathlib import Path
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
 class DrumDataset(Dataset):
@@ -149,11 +149,11 @@ class DrumDataset(Dataset):
         
         return mix, targets
 
-def get_drum_datasets(args):
+def get_drum_datasets(args, split='train'):
     """Create train and valid datasets for drum separation."""
     # Get dataset paths from config
-    sample_dirs = args.dset.get('sample_dirs', [])
-    stem_dirs = args.dset.get('stem_dirs', [])
+    sample_dirs = args.dset.sample_dirs
+    stem_dirs = args.dset.stem_dirs
     
     if not sample_dirs or not stem_dirs:
         raise ValueError("No dataset paths provided in config. Please add 'sample_dirs' and 'stem_dirs' to dset config.")
@@ -171,26 +171,33 @@ def get_drum_datasets(args):
     valid_sample_dirs = sample_dirs[-1:]
     valid_stem_dirs = stem_dirs[-1:]
     
-    train_dataset = DrumDataset(
-        sample_dirs=train_sample_dirs,
-        stem_dirs=train_stem_dirs,
-        sources=args.dset.sources,
-        sample_rate=args.dset.samplerate,
-        segment_duration=args.dset.segment,
-        channels=args.dset.channels,
-        normalize=args.dset.normalize,
-        sample_ratio=args.dset.sample_ratio
-    )
+    if split == 'train':
+        dataset = DrumDataset(
+            sample_dirs=train_sample_dirs,
+            stem_dirs=train_stem_dirs,
+            sources=args.dset.sources,
+            sample_rate=args.dset.samplerate,
+            segment_duration=args.dset.segment,
+            channels=args.dset.channels,
+            normalize=args.dset.normalize,
+            sample_ratio=args.dset.sample_ratio
+        )
+    else:
+        dataset = DrumDataset(
+            sample_dirs=valid_sample_dirs,
+            stem_dirs=valid_stem_dirs,
+            sources=args.dset.sources,
+            sample_rate=args.dset.samplerate,
+            segment_duration=args.dset.segment,
+            channels=args.dset.channels,
+            normalize=args.dset.normalize,
+            sample_ratio=args.dset.sample_ratio
+        )
     
-    valid_dataset = DrumDataset(
-        sample_dirs=valid_sample_dirs,
-        stem_dirs=valid_stem_dirs,
-        sources=args.dset.sources,
-        sample_rate=args.dset.samplerate,
-        segment_duration=args.dset.segment,
-        channels=args.dset.channels,
-        normalize=args.dset.normalize,
-        sample_ratio=args.dset.sample_ratio
+    return DataLoader(
+        dataset,
+        batch_size=args.dset.batch_size,
+        shuffle=(split == 'train'),
+        num_workers=args.misc.num_workers,
+        pin_memory=True
     )
-    
-    return train_dataset, valid_dataset

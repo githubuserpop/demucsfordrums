@@ -15,7 +15,7 @@ class DrumPatternLoss(nn.Module):
         self.register_buffer('window', torch.hann_window(self.n_fft))
         self.sources = ["kick", "snare", "hihat", "toms", "cymbals", "percussion"]
 
-    @torch.cuda.amp.autocast()
+    @torch.amp.autocast('cuda')
     def forward(self, pred_sources, target_sources, pred_patterns=None, target_patterns=None):
         """Memory-efficient forward pass using chunked processing."""
         device = pred_sources.device
@@ -56,7 +56,7 @@ class DrumPatternLoss(nn.Module):
             
         return total_loss / chunks
     
-    @torch.cuda.amp.autocast()
+    @torch.amp.autocast('cuda')
     def _compute_onset_loss(self, pred, target):
         """Memory-efficient onset loss computation."""
         onset_loss = 0
@@ -105,7 +105,7 @@ class DrumPatternLoss(nn.Module):
             
         return total_loss / chunks
     
-    @torch.cuda.amp.autocast()
+    @torch.amp.autocast('cuda')
     def _compute_pattern_loss(self, pred_patterns, target_patterns):
         """Compute pattern loss with gradient checkpointing if needed."""
         if not pred_patterns or not target_patterns:

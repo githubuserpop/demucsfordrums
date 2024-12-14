@@ -20,7 +20,7 @@ from .evaluate import evaluate, new_sdr
 from .svd import svd_penalty
 from .drum_losses import DrumPatternLoss
 from .utils import pull_metric, EMA
-from .data_utils import load_custom_data  # Updated import
+from .drum_datasets import get_drum_datasets  # Updated import
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +33,8 @@ class Solver(object):
     def __init__(self, loaders, model, optimizer, args):
         self.args = args
         self.loaders = loaders or {
-            'train': load_custom_data(TRAINING_FOLDERS, args.batch_size),
-            'valid': load_custom_data(TRAINING_FOLDERS, args.batch_size)
+            'train': get_drum_datasets(args, split='train'),
+            'valid': get_drum_datasets(args, split='valid')
         }
 
         self.model = model
